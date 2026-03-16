@@ -561,10 +561,13 @@ def resolve_dtype(dtype_name: str):
     return torch.bfloat16
 
 
-def build_generator(device: str, seed: Optional[int]):
+def build_generator(device: str, seed: Optional[int], cpu_offload: bool = False):
     if seed is None:
         return None
-    generator_device = "cuda" if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+    if cpu_offload:
+        generator_device = "cpu"
+    else:
+        generator_device = "cuda" if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
     return torch.Generator(device=generator_device).manual_seed(seed)
 
 
@@ -1408,6 +1411,36 @@ def main(argv=None):
     if args.crop_mode != "full":
         hr_output_dir.mkdir(parents=True, exist_ok=True)
 
+    prompt_preview = None
+    if fixed_prompt is not None:
+        prompt_preview = " ".join(str(fixed_prompt).split())
+        if len(prompt_preview) > 120:
+            prompt_preview = prompt_preview[:117] + "..."
+
+    print("[team01_CIPLAB] Runtime configuration", flush=True)
+    print(f"  samples              : {len(samples)}", flush=True)
+    print(f"  output_dir           : {output_dir}", flush=True)
+    print(f"  output_json          : {output_json}", flush=True)
+    print(f"  device               : {args.device}", flush=True)
+    print(f"  dtype                : {args.dtype}", flush=True)
+    print(f"  mode                 : {args.mode}", flush=True)
+    print(f"  crop_mode            : {args.crop_mode}", flush=True)
+    print(f"  guidance_scale       : {args.guidance_scale}", flush=True)
+    print(f"  num_inference_steps  : {args.num_inference_steps}", flush=True)
+    print(f"  seed                 : {args.seed}", flush=True)
+    if args.mode == "canvas_tile":
+        print(
+            f"  canvas_tile          : size={args.tile_size_px}, overlap={args.tile_overlap_px}, batch={args.tile_batch_size}",
+            flush=True,
+        )
+    if args.prompt_name:
+        print(f"  prompt_name          : {args.prompt_name}", flush=True)
+    if fixed_prompt is not None:
+        print(f"  prompt_preview       : {prompt_preview}", flush=True)
+    else:
+        print("  prompt_preview       : <per-sample prompt>", flush=True)
+    print("[team01_CIPLAB] Loading FLUX pipeline...", flush=True)
+
     pipeline = Flux2KleinPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         revision=args.revision,
@@ -1415,6 +1448,7 @@ def main(argv=None):
         torch_dtype=torch_dtype,
     )
     load_requested_loras(pipeline, args)
+    print("[team01_CIPLAB] Pipeline and LoRA adapters are loaded.", flush=True)
 
     if args.cpu_offload and args.device.startswith("cuda"):
         pipeline.enable_model_cpu_offload()
@@ -1431,14 +1465,13 @@ def main(argv=None):
             device=getattr(pipeline, "_execution_device", args.device),
             guidance_scale=args.guidance_scale,
         )
-        if args.device.startswith("cuda") and not args.cpu_offload:
-            maybe_move_text_encoders_to_cpu(pipeline)
 
     # Keep only the dataset-level progress bar for cleaner logs.
     pipeline.set_progress_bar_config(disable=True)
 
     results = []
     used_output_names: set[str] = set()
+    print("[team01_CIPLAB] Starting inference loop...", flush=True)
     sample_iter = tqdm(range(0, len(samples)), total=len(samples), desc="Inference", unit="sample", dynamic_ncols=True)
     use_center_crop_batching = args.mode == "plain" and args.crop_mode == "center_crop" and args.sample_batch_size > 1
     while sample_iter.n < len(samples):
@@ -1458,7 +1491,7 @@ def main(argv=None):
             sample_iter.set_postfix_str(cond_path.name)
 
             seed = None if args.seed < 0 else args.seed + index
-            generator = build_generator(args.device, seed)
+            generator = build_generator(args.device, seed, cpu_offload=args.cpu_offload)
 
             condition_image = load_rgb_image(cond_path)
             hr_image = None
@@ -1552,6 +1585,7 @@ def main(argv=None):
 
     with output_json.open("w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=2, ensure_ascii=False)
+    print(f"[team01_CIPLAB] Finished. Saved {len(results)} images to {output_dir}", flush=True)
 
 
 if __name__ == "__main__":

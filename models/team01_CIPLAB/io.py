@@ -1,64 +1,119 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
+try:
+    from . import hat_backend
+except ImportError:
+    import hat_backend
+
 
 TEAM_DIR = Path(__file__).resolve().parent
+REPO_ROOT = TEAM_DIR.parent.parent
+TEAM_MODEL_ZOO_DIR = REPO_ROOT / "model_zoo" / "team01_CIPLAB"
 INFERENCE_DIR = TEAM_DIR / "inference"
-DEFAULT_CONFIG_NAMES = ("inference_config.json", "config.json")
+
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+LORA_ARTIFACT_NAMES = (
+    "pytorch_lora_weights.safetensors",
+    "pytorch_lora_weights.bin",
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "adapter_config.json",
+)
+
+BASE_MODEL_DIRNAME = "flux2-klein-base-9b"
+DEFAULT_PROMPT_NAME = "test_3"
+DEFAULT_MODE = "canvas_tile"
+DEFAULT_CROP_MODE = "full"
+DEFAULT_TILE_SIZE_PX = 1024
+DEFAULT_TILE_OVERLAP_PX = 512
+DEFAULT_TILE_BATCH_SIZE = 9
+DEFAULT_TILE_SIGMA_RATIO = 0.15
+DEFAULT_CANVAS_PADDING_MODE = "reflect"
+DEFAULT_CANVAS_PADDING_POSITION = "center"
+DEFAULT_CANVAS_PADDING_VALUE = 0.0
+DEFAULT_GUIDANCE_SCALE = 4.0
+DEFAULT_NUM_INFERENCE_STEPS = 50
+DEFAULT_DTYPE = "bf16"
+DEFAULT_SEED = 0
+DEFAULT_CPU_OFFLOAD = True
+
+STAGE_SPECS = (
+    {
+        "label": "stage1(pixel)",
+        "adapter_name": "pix",
+        "aliases": ("stage1", "pixel", "pix"),
+        "env_vars": ("CIPLAB_STAGE1_PATH", "CIPLAB_PIX_LORA_PATH"),
+        "required": True,
+    },
+    {
+        "label": "stage2(sem)",
+        "adapter_name": "sem",
+        "aliases": ("stage2", "sem"),
+        "env_vars": ("CIPLAB_STAGE2_PATH", "CIPLAB_SEM_LORA_PATH"),
+        "required": True,
+    },
+    {
+        "label": "stage3(sem2)",
+        "adapter_name": "sem2",
+        "aliases": ("stage3", "sem2"),
+        "env_vars": ("CIPLAB_STAGE3_PATH", "CIPLAB_SEM2_LORA_PATH"),
+        "required": False,
+    },
+)
 
 
-def _resolve_config_path(model_dir: str | None) -> Path:
-    if not model_dir:
-        for name in DEFAULT_CONFIG_NAMES:
-            candidate = TEAM_DIR / name
-            if candidate.exists():
-                return candidate
-        raise FileNotFoundError(
-            f"No inference config found in {TEAM_DIR}. Expected one of: {', '.join(DEFAULT_CONFIG_NAMES)}"
-        )
-
-    path = Path(model_dir).expanduser().resolve()
-    if path.is_file():
-        return path
-
-    if path.is_dir():
-        for name in DEFAULT_CONFIG_NAMES:
-            candidate = path / name
-            if candidate.exists():
-                return candidate
-
-    raise FileNotFoundError(f"Could not resolve an inference config from: {path}")
+def _iter_existing_dirs(paths):
+    seen = set()
+    for path in paths:
+        resolved = path.resolve()
+        if not resolved.exists() or not resolved.is_dir():
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield resolved
 
 
-def _load_config(config_path: Path) -> dict:
-    with config_path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict):
-        raise ValueError(f"Inference config must be a JSON object: {config_path}")
-    return data
+def _has_image_files(path: Path) -> bool:
+    return any(
+        item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS
+        for item in sorted(path.iterdir())
+    )
 
 
-def _stringify_value(value):
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _build_manifest(input_path: str) -> Path:
+def _resolve_input_dir(input_path: str) -> Path:
     input_dir = Path(input_path).expanduser().resolve()
     if not input_dir.is_dir():
         raise NotADirectoryError(f"Input path must be a directory of images: {input_dir}")
+
+    if _has_image_files(input_dir):
+        return input_dir
+
+    for child_name in ("LQ", "lq", "LR", "lr", "input", "inputs"):
+        child_dir = input_dir / child_name
+        if child_dir.is_dir() and _has_image_files(child_dir):
+            return child_dir.resolve()
+
+    raise ValueError(
+        f"No input images found under: {input_dir}. "
+        "Expected images directly in the folder or under an `LQ` subdirectory."
+    )
+
+
+def _build_manifest(input_path: str) -> Path:
+    input_dir = _resolve_input_dir(input_path)
 
     items = []
     for image_path in sorted(input_dir.iterdir()):
         if image_path.suffix.lower() not in IMAGE_EXTENSIONS or not image_path.is_file():
             continue
-        # The copied inference expects both `hr` and `res/lr`. For challenge inference we reuse the input image path.
         items.append({"hr": str(image_path), "res": str(image_path)})
 
     if not items:
@@ -70,50 +125,406 @@ def _build_manifest(input_path: str) -> Path:
     return Path(temp_path)
 
 
-def _build_cli_args(config: dict, input_json: Path, output_path: str, device=None) -> list[str]:
+def _resolve_override_path(raw_path: str, label: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        search_candidates = [candidate]
+    else:
+        search_candidates = [
+            TEAM_MODEL_ZOO_DIR / candidate,
+            REPO_ROOT / candidate,
+            TEAM_DIR / candidate,
+            candidate,
+        ]
+
+    for item in search_candidates:
+        resolved = item.resolve()
+        if resolved.exists():
+            return resolved
+
+    searched = ", ".join(str(path.resolve()) for path in search_candidates)
+    raise FileNotFoundError(f"Could not resolve {label}: {raw_path}. Tried: {searched}")
+
+
+def _contains_lora_artifacts(path: Path) -> bool:
+    return any((path / name).exists() for name in LORA_ARTIFACT_NAMES)
+
+
+def _checkpoint_sort_key(path: Path):
+    suffix = path.name.split("checkpoint-", 1)[-1]
+    try:
+        return (1, int(suffix))
+    except ValueError:
+        return (0, path.name)
+
+
+def _resolve_lora_checkpoint(path: Path, label: str) -> Path:
+    resolved = path.resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label} path does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"{label} path must be a directory: {resolved}")
+
+    if resolved.name.startswith("checkpoint-") and _contains_lora_artifacts(resolved):
+        return resolved
+
+    checkpoints = sorted(
+        (
+            child.resolve()
+            for child in resolved.iterdir()
+            if child.is_dir() and child.name.startswith("checkpoint-")
+        ),
+        key=_checkpoint_sort_key,
+    )
+    if checkpoints:
+        return checkpoints[-1]
+
+    if _contains_lora_artifacts(resolved):
+        return resolved
+
+    raise FileNotFoundError(f"Could not find a LoRA checkpoint for {label} under: {resolved}")
+
+
+def _is_base_model_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        (path / "model_index.json").exists()
+        or (path / "transformer").is_dir()
+        or (path / "vae").is_dir()
+    )
+
+
+def _discover_base_model_path() -> Path:
+    for env_name in ("CIPLAB_BASE_MODEL_PATH", "CIPLAB_PRETRAINED_MODEL_PATH"):
+        raw_path = os.environ.get(env_name)
+        if not raw_path:
+            continue
+        candidate = _resolve_override_path(raw_path, "base model")
+        if not _is_base_model_dir(candidate):
+            raise FileNotFoundError(
+                f"Resolved base model path does not look like a diffusers checkpoint: {candidate}"
+            )
+        return candidate
+
+    direct_candidates = [
+        TEAM_MODEL_ZOO_DIR / BASE_MODEL_DIRNAME,
+        REPO_ROOT / "model_zoo" / BASE_MODEL_DIRNAME,
+    ]
+    for candidate in direct_candidates:
+        if _is_base_model_dir(candidate):
+            return candidate.resolve()
+
+    for search_root in _iter_existing_dirs((TEAM_MODEL_ZOO_DIR, REPO_ROOT / "model_zoo")):
+        for candidate in sorted(search_root.rglob(BASE_MODEL_DIRNAME)):
+            if _is_base_model_dir(candidate):
+                return candidate.resolve()
+
+    raise FileNotFoundError(
+        f"Could not find `{BASE_MODEL_DIRNAME}` under `{TEAM_MODEL_ZOO_DIR}`. "
+        "Set `CIPLAB_BASE_MODEL_PATH` if your layout is different."
+    )
+
+
+def _stage_candidates_from_root(root: Path, stage_spec: dict) -> list[Path]:
+    candidates = []
+    for alias in stage_spec["aliases"]:
+        candidates.extend(
+            (
+                root / alias,
+                root / "train" / alias,
+                root / "loras" / alias,
+                root / "lora" / alias,
+                root / "checkpoints" / alias,
+            )
+        )
+    return list(_iter_existing_dirs(candidates))
+
+
+def _resolve_stage_from_root(root: Path, stage_spec: dict) -> Path:
+    for candidate in _stage_candidates_from_root(root, stage_spec):
+        try:
+            return _resolve_lora_checkpoint(candidate, stage_spec["label"])
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(f"Could not find {stage_spec['label']} under: {root}")
+
+
+def _try_resolve_stage_from_root(root: Path, stage_spec: dict):
+    try:
+        return _resolve_stage_from_root(root, stage_spec)
+    except FileNotFoundError:
+        return None
+
+
+def _candidate_run_roots():
+    roots = [(TEAM_MODEL_ZOO_DIR, False)]
+
+    child_roots = []
+    if TEAM_MODEL_ZOO_DIR.is_dir():
+        for child in TEAM_MODEL_ZOO_DIR.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name == BASE_MODEL_DIRNAME or child.name.startswith("."):
+                continue
+            child_roots.append(child.resolve())
+    child_roots.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    roots.extend((path, True) for path in child_roots)
+
+    repo_train_dir = REPO_ROOT / "train"
+    if repo_train_dir.is_dir():
+        roots.append((repo_train_dir.resolve(), False))
+
+    return roots
+
+
+def _discover_run_root() -> Path:
+    for env_name in ("CIPLAB_RUN_DIR", "CIPLAB_MODEL_RUN_DIR"):
+        raw_path = os.environ.get(env_name)
+        if not raw_path:
+            continue
+        candidate = _resolve_override_path(raw_path, "run root")
+        if not candidate.is_dir():
+            raise NotADirectoryError(f"Resolved run root is not a directory: {candidate}")
+        missing_required = [
+            stage_spec["label"]
+            for stage_spec in STAGE_SPECS
+            if stage_spec["required"] and _try_resolve_stage_from_root(candidate, stage_spec) is None
+        ]
+        if missing_required:
+            raise FileNotFoundError(
+                f"Resolved run root is missing required stages {missing_required}: {candidate}"
+            )
+        return candidate
+
+    checked_roots = []
+    for root, _ in _candidate_run_roots():
+        checked_roots.append(str(root))
+        missing_required = [
+            stage_spec["label"]
+            for stage_spec in STAGE_SPECS
+            if stage_spec["required"] and _try_resolve_stage_from_root(root, stage_spec) is None
+        ]
+        if not missing_required:
+            return root
+
+    checked = ", ".join(checked_roots) if checked_roots else "<none>"
+    raise FileNotFoundError(
+        "Could not find a single run directory containing required stage1/stage2 LoRA weights. "
+        f"Checked: {checked}. Set `CIPLAB_RUN_DIR` if needed."
+    )
+
+
+def _discover_stage_paths(run_root: Path) -> dict[str, Path]:
+    stage_paths = {}
+    for stage_spec in STAGE_SPECS:
+        stage_path = None
+        for env_name in stage_spec["env_vars"]:
+            raw_path = os.environ.get(env_name)
+            if raw_path:
+                stage_path = _resolve_lora_checkpoint(
+                    _resolve_override_path(raw_path, stage_spec["label"]),
+                    stage_spec["label"],
+                )
+                break
+
+        if stage_path is None:
+            if stage_spec["required"]:
+                stage_path = _resolve_stage_from_root(run_root, stage_spec)
+            else:
+                stage_path = _try_resolve_stage_from_root(run_root, stage_spec)
+
+        if stage_path is not None:
+            stage_paths[stage_spec["adapter_name"]] = stage_path
+
+    return stage_paths
+
+
+def _make_temp_json_path(prefix: str) -> Path:
+    fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".json")
+    os.close(fd)
+    return Path(temp_path)
+
+
+def _resolve_runtime(output_path: str) -> dict:
+    output_dir = Path(output_path).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_root = _discover_run_root()
+    stage_paths = _discover_stage_paths(run_root)
+    base_model_path = _discover_base_model_path()
+    sem_adapter_names = ["sem"]
+    sem_lora_paths = [str(stage_paths["sem"])]
+    sem_adapter_scales = ["1.0"]
+    if "sem2" in stage_paths:
+        sem_adapter_names.append("sem2")
+        sem_lora_paths.append(str(stage_paths["sem2"]))
+        sem_adapter_scales.append("1.0")
+
+    return {
+        "output_dir": output_dir,
+        "run_root": run_root,
+        "base_model_path": base_model_path,
+        "stage_paths": stage_paths,
+        "sem_adapter_names": sem_adapter_names,
+        "sem_lora_paths": sem_lora_paths,
+        "sem_adapter_scales": sem_adapter_scales,
+    }
+
+
+def _build_cli_args(input_json: Path, output_json: Path, runtime: dict) -> list[str]:
+    output_dir = runtime["output_dir"]
+    stage_paths = runtime["stage_paths"]
+
     args = [
+        "--pretrained_model_name_or_path",
+        str(runtime["base_model_path"]),
         "--input_json",
         str(input_json),
         "--output_dir",
-        str(Path(output_path).expanduser().resolve()),
+        str(output_dir),
+        "--output_json",
+        str(output_json),
+        "--prompts_json",
+        str((INFERENCE_DIR / "prompts.json").resolve()),
+        "--prompt_name",
+        DEFAULT_PROMPT_NAME,
+        "--mode",
+        DEFAULT_MODE,
+        "--crop_mode",
+        DEFAULT_CROP_MODE,
+        "--tile_size_px",
+        str(DEFAULT_TILE_SIZE_PX),
+        "--tile_overlap_px",
+        str(DEFAULT_TILE_OVERLAP_PX),
+        "--tile_batch_size",
+        str(DEFAULT_TILE_BATCH_SIZE),
+        "--sample_batch_size",
+        "1",
+        "--tile_sigma_ratio",
+        str(DEFAULT_TILE_SIGMA_RATIO),
+        "--canvas_padding_mode",
+        DEFAULT_CANVAS_PADDING_MODE,
+        "--canvas_padding_position",
+        DEFAULT_CANVAS_PADDING_POSITION,
+        "--canvas_padding_value",
+        str(DEFAULT_CANVAS_PADDING_VALUE),
+        "--guidance_scale",
+        str(DEFAULT_GUIDANCE_SCALE),
+        "--num_inference_steps",
+        str(DEFAULT_NUM_INFERENCE_STEPS),
+        "--dtype",
+        DEFAULT_DTYPE,
+        "--seed",
+        str(DEFAULT_SEED),
+        "--pix_lora_weights_path",
+        str(stage_paths["pix"]),
+        "--pix_adapter_name",
+        "pix",
+        "--pix_adapter_scale",
+        "1.0",
     ]
 
-    for key, value in config.items():
-        if value is None:
-            continue
-        option = f"--{key}"
-        if isinstance(value, bool):
-            if value:
-                args.append(option)
-            continue
-        if isinstance(value, list):
-            if not value:
-                continue
-            joined = ",".join(_stringify_value(item) for item in value)
-            args.extend([option, joined])
-            continue
-        if value == "":
-            continue
-        args.extend([option, _stringify_value(value)])
+    if DEFAULT_CPU_OFFLOAD:
+        args.append("--cpu_offload")
 
-    if device is not None:
-        args.extend(["--device", str(device)])
+    args.extend(
+        [
+            "--sem_adapter_names",
+            ",".join(runtime["sem_adapter_names"]),
+            "--sem_lora_weights_paths",
+            ",".join(runtime["sem_lora_paths"]),
+            "--sem_adapter_scales",
+            ",".join(runtime["sem_adapter_scales"]),
+        ]
+    )
 
     return args
 
 
-def main(model_dir=None, input_path=None, output_path=None, device=None):
+def _read_manifest_info(manifest_path: Path):
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        items = json.load(handle)
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"Manifest must contain at least one sample: {manifest_path}")
+
+    first_res_path = Path(items[0]["res"]).expanduser().resolve()
+    return first_res_path.parent, len(items)
+
+
+def _print_launch_summary(input_dir: Path, sample_count: int, runtime: dict) -> None:
+    stage_paths = runtime["stage_paths"]
+    sem2_path = stage_paths.get("sem2")
+    print("[team01_CIPLAB] Launch configuration", flush=True)
+    print(f"  input_dir            : {input_dir}", flush=True)
+    print(f"  output_dir           : {runtime['output_dir']}", flush=True)
+    print(f"  num_samples          : {sample_count}", flush=True)
+    print(f"  base_model           : {runtime['base_model_path']}", flush=True)
+    print(f"  run_root             : {runtime['run_root']}", flush=True)
+    print(f"  stage1_pix           : {stage_paths['pix']}", flush=True)
+    print(f"  stage2_sem           : {stage_paths['sem']}", flush=True)
+    print(f"  stage3_sem2          : {sem2_path if sem2_path else '<disabled>'}", flush=True)
+    print(f"  prompt_name          : {DEFAULT_PROMPT_NAME}", flush=True)
+    print(f"  mode                 : {DEFAULT_MODE}", flush=True)
+    print(f"  crop_mode            : {DEFAULT_CROP_MODE}", flush=True)
+    print(
+        f"  tile                 : size={DEFAULT_TILE_SIZE_PX}, overlap={DEFAULT_TILE_OVERLAP_PX}, batch={DEFAULT_TILE_BATCH_SIZE}",
+        flush=True,
+    )
+    print(
+        f"  guidance/steps/dtype : {DEFAULT_GUIDANCE_SCALE} / {DEFAULT_NUM_INFERENCE_STEPS} / {DEFAULT_DTYPE}",
+        flush=True,
+    )
+    print(
+        f"  cpu_offload          : {'on' if DEFAULT_CPU_OFFLOAD else 'off'}",
+        flush=True,
+    )
+
+
+def _run_hat_preprocess(input_path: str) -> Path:
+    temp_dir = Path(tempfile.mkdtemp(prefix="ciplab_hat_pre_", dir="/tmp")).resolve()
+    print("[team01_CIPLAB] Starting HAT preprocessing stage...", flush=True)
+    print(f"  hat_output_dir       : {temp_dir}", flush=True)
+    hat_backend.run_from_input_dir(input_path, str(temp_dir))
+    print("[team01_CIPLAB] HAT preprocessing finished.", flush=True)
+    return temp_dir
+
+
+def main(input_path: str, output_path: str):
     if input_path is None or output_path is None:
         raise ValueError("`input_path` and `output_path` are required.")
 
-    from .inference import lora_inference
+    try:
+        from .inference import lora_inference
+    except ImportError:
+        from inference import lora_inference
 
-    config_path = _resolve_config_path(model_dir)
-    config = _load_config(config_path)
-    manifest_path = _build_manifest(input_path)
+    hat_output_dir = _run_hat_preprocess(input_path)
+    manifest_path = _build_manifest(str(hat_output_dir))
+    output_json_path = _make_temp_json_path("ciplab_results_")
 
     try:
-        cli_args = _build_cli_args(config, manifest_path, output_path, device=device)
+        runtime = _resolve_runtime(output_path)
+        input_dir, sample_count = _read_manifest_info(manifest_path)
+        _print_launch_summary(input_dir, sample_count, runtime)
+        cli_args = _build_cli_args(manifest_path, output_json_path, runtime)
         lora_inference.main(cli_args)
     finally:
         manifest_path.unlink(missing_ok=True)
+        output_json_path.unlink(missing_ok=True)
+        keep_hat_output = os.environ.get("CIPLAB_KEEP_HAT_OUTPUT", "").strip().lower() in {"1", "true", "yes", "on"}
+        if keep_hat_output:
+            print(f"[team01_CIPLAB] Keeping intermediate HAT output: {hat_output_dir}", flush=True)
+        else:
+            shutil.rmtree(hat_output_dir, ignore_errors=True)
+
+
+def _parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description="Run team01_CIPLAB inference with auto-discovered base model and stage LoRAs."
+    )
+    parser.add_argument("input_path", type=str, help="Image directory or dataset root containing an `LQ` folder.")
+    parser.add_argument("output_path", type=str, help="Directory where restored images will be written.")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    cli_args = _parse_cli_args()
+    main(cli_args.input_path, cli_args.output_path)
