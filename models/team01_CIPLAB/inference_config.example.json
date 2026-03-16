@@ -1,0 +1,38 @@
+{
+  "pretrained_model_name_or_path": "/abs/path/to/flux2-klein-base-9b",
+  "pix_lora_weights_path": "/abs/path/to/pix/checkpoint-30000",
+  "pix_adapter_name": "pix",
+  "pix_adapter_scale": 1.0,
+  "sem_adapter_names": [
+    "sem",
+    "sem2"
+  ],
+  "sem_lora_weights_paths": [
+    "/abs/path/to/sem/checkpoint-2000",
+    "/abs/path/to/sem2/checkpoint-2000"
+  ],
+  "sem_adapter_scales": [
+    1.0,
+    1.0
+  ],
+  "prompt_name": "test_3",
+  "prompts_json": "/mnt/jaeho/code/NTIRE2026_ImageSR_x4/models/team01_CIPLAB/inference/prompts.json",
+  "crop_mode": "center_crop",
+  "resolution": 1024,
+  "mode": "plain",
+  "tile_size_px": 1024,
+  "tile_overlap_ratio": 0.25,
+  "tile_batch_size": 8,
+  "sample_batch_size": 1,
+  "tile_sigma_ratio": 0.15,
+  "canvas_padding_mode": "reflect",
+  "canvas_padding_position": "center",
+  "canvas_padding_value": 0.0,
+  "guidance_scale": 4.0,
+  "num_inference_steps": 50,
+  "dtype": "bf16",
+  "device": "cuda",
+  "seed": 0,
+  "cpu_offload": true,
+  "gpu_devices": "0"
+}
