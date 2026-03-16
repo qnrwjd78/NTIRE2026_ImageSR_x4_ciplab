@@ -21,6 +21,11 @@ def select_model(args, device):
         name = f"{model_id:02}_DAT_baseline"
         model_path = os.path.join('model_zoo', 'team00_dat.pth')
         model_func = DAT
+    elif model_id == 1:
+        from models.team01_CIPLAB.main import main as TEAM01_CIPLAB
+        name = f"{model_id:02}_team01_CIPLAB"
+        model_path = os.path.join("model_zoo", "team01_CIPLAB")
+        model_func = TEAM01_CIPLAB
     else:
         raise NotImplementedError(f"Model {model_id} is not implemented.")
 

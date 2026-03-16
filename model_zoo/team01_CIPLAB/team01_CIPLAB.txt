@@ -1,1 +1,2 @@
 https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B
+https://huggingface.co/jaideepsingh/upscale_models/resolve/main/HAT/HAT-L_SRx4_ImageNet-pretrain.pth

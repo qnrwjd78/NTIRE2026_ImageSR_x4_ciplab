@@ -1,2 +1,10 @@
-model_zoo/team01_CIPLAB/
-*/_pycache_/
+model_zoo/team01_CIPLAB/flux2-klein-base-9b
+model_zoo/team01_CIPLAB/model1_l2
+model_zoo/team01_CIPLAB/model2_aesop
+model_zoo/team01_CIPLAB/HAT-L_SRx4_ImageNet-pretrain.pth
+results/
+*/results/
+output/
+*/output/
+__pycache__/
+*/__pycache__/

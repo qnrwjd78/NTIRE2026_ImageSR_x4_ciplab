@@ -8,15 +8,16 @@ import tempfile
 from pathlib import Path
 
 try:
-    from . import hat_backend
+    from .step1 import hat_backend
 except ImportError:
-    import hat_backend
+    from step1 import hat_backend
 
 
 TEAM_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TEAM_DIR.parent.parent
 TEAM_MODEL_ZOO_DIR = REPO_ROOT / "model_zoo" / "team01_CIPLAB"
-INFERENCE_DIR = TEAM_DIR / "inference"
+INFERENCE_DIR = TEAM_DIR / "step2"
+TMP_ROOT = REPO_ROOT / "tmp"
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 LORA_ARTIFACT_NAMES = (
@@ -33,7 +34,7 @@ DEFAULT_MODE = "canvas_tile"
 DEFAULT_CROP_MODE = "full"
 DEFAULT_TILE_SIZE_PX = 1024
 DEFAULT_TILE_OVERLAP_PX = 512
-DEFAULT_TILE_BATCH_SIZE = 9
+DEFAULT_TILE_BATCH_SIZE = 6
 DEFAULT_TILE_SIGMA_RATIO = 0.15
 DEFAULT_CANVAS_PADDING_MODE = "reflect"
 DEFAULT_CANVAS_PADDING_POSITION = "center"
@@ -43,6 +44,7 @@ DEFAULT_NUM_INFERENCE_STEPS = 50
 DEFAULT_DTYPE = "bf16"
 DEFAULT_SEED = 0
 DEFAULT_CPU_OFFLOAD = True
+PREFERRED_RUN_ROOT_NAMES = ("model2_aesop",)
 
 STAGE_SPECS = (
     {
@@ -88,8 +90,30 @@ def _has_image_files(path: Path) -> bool:
     )
 
 
+def _resolve_repo_path(path_value: str | Path) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+def _normalize_device_arg(device) -> str | None:
+    if device is None:
+        return None
+    if hasattr(device, "type"):
+        device_type = getattr(device, "type", None)
+        device_index = getattr(device, "index", None)
+        if device_type is None:
+            return str(device)
+        if device_index is None:
+            return str(device_type)
+        return f"{device_type}:{device_index}"
+    device_text = str(device).strip()
+    return device_text or None
+
+
 def _resolve_input_dir(input_path: str) -> Path:
-    input_dir = Path(input_path).expanduser().resolve()
+    input_dir = _resolve_repo_path(input_path)
     if not input_dir.is_dir():
         raise NotADirectoryError(f"Input path must be a directory of images: {input_dir}")
 
@@ -109,6 +133,7 @@ def _resolve_input_dir(input_path: str) -> Path:
 
 def _build_manifest(input_path: str) -> Path:
     input_dir = _resolve_input_dir(input_path)
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
     items = []
     for image_path in sorted(input_dir.iterdir()):
@@ -119,31 +144,17 @@ def _build_manifest(input_path: str) -> Path:
     if not items:
         raise ValueError(f"No input images found under: {input_dir}")
 
-    fd, temp_path = tempfile.mkstemp(prefix="ciplab_infer_", suffix=".json")
+    fd, temp_path = tempfile.mkstemp(prefix="ciplab_infer_", suffix=".json", dir=str(TMP_ROOT))
     os.close(fd)
     Path(temp_path).write_text(json.dumps(items, indent=2), encoding="utf-8")
     return Path(temp_path)
 
 
 def _resolve_override_path(raw_path: str, label: str) -> Path:
-    candidate = Path(raw_path).expanduser()
-    if candidate.is_absolute():
-        search_candidates = [candidate]
-    else:
-        search_candidates = [
-            TEAM_MODEL_ZOO_DIR / candidate,
-            REPO_ROOT / candidate,
-            TEAM_DIR / candidate,
-            candidate,
-        ]
-
-    for item in search_candidates:
-        resolved = item.resolve()
-        if resolved.exists():
-            return resolved
-
-    searched = ", ".join(str(path.resolve()) for path in search_candidates)
-    raise FileNotFoundError(f"Could not resolve {label}: {raw_path}. Tried: {searched}")
+    resolved = _resolve_repo_path(raw_path)
+    if resolved.exists():
+        return resolved
+    raise FileNotFoundError(f"Could not resolve {label}: {raw_path}. Tried: {resolved}")
 
 
 def _contains_lora_artifacts(path: Path) -> bool:
@@ -266,7 +277,15 @@ def _candidate_run_roots():
             if child.name == BASE_MODEL_DIRNAME or child.name.startswith("."):
                 continue
             child_roots.append(child.resolve())
-    child_roots.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    preferred_names = {name: index for index, name in enumerate(PREFERRED_RUN_ROOT_NAMES)}
+    child_roots.sort(
+        key=lambda path: (
+            0 if path.name in preferred_names else 1,
+            preferred_names.get(path.name, len(preferred_names)),
+            -path.stat().st_mtime,
+            path.name,
+        )
+    )
     roots.extend((path, True) for path in child_roots)
 
     repo_train_dir = REPO_ROOT / "train"
@@ -339,13 +358,14 @@ def _discover_stage_paths(run_root: Path) -> dict[str, Path]:
 
 
 def _make_temp_json_path(prefix: str) -> Path:
-    fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".json")
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".json", dir=str(TMP_ROOT))
     os.close(fd)
     return Path(temp_path)
 
 
 def _resolve_runtime(output_path: str) -> dict:
-    output_dir = Path(output_path).expanduser().resolve()
+    output_dir = _resolve_repo_path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_root = _discover_run_root()
     stage_paths = _discover_stage_paths(run_root)
@@ -369,7 +389,7 @@ def _resolve_runtime(output_path: str) -> dict:
     }
 
 
-def _build_cli_args(input_json: Path, output_json: Path, runtime: dict) -> list[str]:
+def _build_cli_args(input_json: Path, output_json: Path, runtime: dict, device=None) -> list[str]:
     output_dir = runtime["output_dir"]
     stage_paths = runtime["stage_paths"]
 
@@ -425,6 +445,10 @@ def _build_cli_args(input_json: Path, output_json: Path, runtime: dict) -> list[
     if DEFAULT_CPU_OFFLOAD:
         args.append("--cpu_offload")
 
+    normalized_device = _normalize_device_arg(device)
+    if normalized_device:
+        args.extend(["--device", normalized_device])
+
     args.extend(
         [
             "--sem_adapter_names",
@@ -478,25 +502,26 @@ def _print_launch_summary(input_dir: Path, sample_count: int, runtime: dict) -> 
     )
 
 
-def _run_hat_preprocess(input_path: str) -> Path:
-    temp_dir = Path(tempfile.mkdtemp(prefix="ciplab_hat_pre_", dir="/tmp")).resolve()
+def _run_hat_preprocess(input_path: str, device=None) -> Path:
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="ciplab_hat_pre_", dir=str(TMP_ROOT))).resolve()
     print("[team01_CIPLAB] Starting HAT preprocessing stage...", flush=True)
     print(f"  hat_output_dir       : {temp_dir}", flush=True)
-    hat_backend.run_from_input_dir(input_path, str(temp_dir))
+    hat_backend.run_from_input_dir(input_path, str(temp_dir), device=device)
     print("[team01_CIPLAB] HAT preprocessing finished.", flush=True)
     return temp_dir
 
 
-def main(input_path: str, output_path: str):
+def main(input_path: str, output_path: str, device=None):
     if input_path is None or output_path is None:
         raise ValueError("`input_path` and `output_path` are required.")
 
     try:
-        from .inference import lora_inference
+        from .step2 import lora_inference
     except ImportError:
-        from inference import lora_inference
+        from step2 import lora_inference
 
-    hat_output_dir = _run_hat_preprocess(input_path)
+    hat_output_dir = _run_hat_preprocess(input_path, device=device)
     manifest_path = _build_manifest(str(hat_output_dir))
     output_json_path = _make_temp_json_path("ciplab_results_")
 
@@ -504,7 +529,7 @@ def main(input_path: str, output_path: str):
         runtime = _resolve_runtime(output_path)
         input_dir, sample_count = _read_manifest_info(manifest_path)
         _print_launch_summary(input_dir, sample_count, runtime)
-        cli_args = _build_cli_args(manifest_path, output_json_path, runtime)
+        cli_args = _build_cli_args(manifest_path, output_json_path, runtime, device=device)
         lora_inference.main(cli_args)
     finally:
         manifest_path.unlink(missing_ok=True)
