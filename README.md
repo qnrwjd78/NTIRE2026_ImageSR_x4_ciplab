@@ -66,10 +66,26 @@ model_zoo/
 
 `test.py` can also launch `team01_CIPLAB`.
 
-Use `model_id = 1`:
+Use `model_id = 1`.
+
+> [!IMPORTANT]
+> The Docker container mounts the repository root to `/workspace`:
+>
+> ```bash
+> docker run --gpus all -it --rm \
+>   -v $(pwd):/workspace \
+>   team01_ciplab
+> ```
+>
+> Therefore, when running `test.py`, both `--test_dir` and `--save_dir`
+> must refer to paths visible **inside the container**, usually under `/workspace`.
+>
+> Do **not** use host-only absolute paths unless they are separately mounted into the container.
+
+Example:
 
 ```bash
-python test.py --test_dir /path/to/LR --save_dir /path/to/save --model_id 1
-```
-
-This path calls `models.team01_CIPLAB.main`, which forwards to the same `io.py` pipeline.
+python test.py \
+  --test_dir /workspace/path/to/LR \
+  --save_dir /workspace/path/to/save \
+  --model_id 1
