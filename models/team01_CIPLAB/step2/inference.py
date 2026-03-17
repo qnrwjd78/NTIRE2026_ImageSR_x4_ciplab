@@ -32,6 +32,7 @@ from diffusers import Flux2KleinPipeline
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from tqdm.auto import tqdm
+from .colorfix import adain_color_fix
 
 
 DTYPE = torch.bfloat16
@@ -579,9 +580,11 @@ def main(argv=None):
             guidance_scale=guidance_scale,
             generator=make_generator(seed, index),
         )
-
+        
+        postfix = adain_color_fix(output_image, condition_image)
+        
         output_path = output_dir / f"{condition_path.name}"
-        output_image.save(output_path)
+        postfix.save(output_path)
 
         result = {
             "condition_image": str(condition_path),
