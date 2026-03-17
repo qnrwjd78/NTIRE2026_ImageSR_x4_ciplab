@@ -4,9 +4,13 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+
+try:
+    from .step1 import hat_backend
+except ImportError:
+    from step1 import hat_backend
 
 
 TEAM_DIR = Path(__file__).resolve().parent
@@ -327,30 +331,6 @@ def _load_prompt_text(prompt_name: str) -> str:
     raise KeyError(f"Prompt `{prompt_name}` not found in {prompts_path}")
 
 
-def _load_prompt_text(prompt_name: str) -> str:
-    prompts_path = (INFERENCE_DIR / "prompts.json").resolve()
-    if not prompts_path.is_file():
-        raise FileNotFoundError(f"Missing prompts.json: {prompts_path}")
-
-    with prompts_path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    if not isinstance(data, list):
-        raise ValueError(f"prompts.json must be a list: {prompts_path}")
-
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("name") != prompt_name:
-            continue
-        prompt = entry.get("prompt")
-        if prompt is None or not str(prompt).strip():
-            raise ValueError(f"Prompt `{prompt_name}` has an empty `prompt` field in {prompts_path}")
-        return str(prompt).strip()
-
-    raise KeyError(f"Prompt `{prompt_name}` not found in {prompts_path}")
-
-
 def _resolve_runtime(output_path: str) -> dict:
     output_dir = _resolve_repo_path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -363,7 +343,6 @@ def _resolve_runtime(output_path: str) -> dict:
         "run_root": run_root,
         "base_model_path": base_model_path,
         "stage_paths": stage_paths,
-    }
     }
 
 def _print_launch_summary(input_dir: Path, sample_count: int, runtime: dict) -> None:
@@ -398,16 +377,7 @@ def _run_hat_preprocess(input_path: str, device=None) -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix="ciplab_hat_pre_", dir=str(TMP_ROOT))).resolve()
     print("[team01_CIPLAB] Starting HAT preprocessing stage...", flush=True)
     print(f"  hat_output_dir       : {temp_dir}", flush=True)
-    device_text = _normalize_device_arg(device)
-    cmd = _conda_env_prefix("hat_env", "hat_env") + [
-        "python",
-        "-m",
-        "models.team01_CIPLAB.step1.run",
-    ]
-    if device_text:
-        cmd.extend(["--device", device_text])
-    cmd.extend([str(input_path), str(temp_dir)])
-    subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+    hat_backend.run_from_input_dir(input_path, str(temp_dir), device=device)
     print("[team01_CIPLAB] HAT preprocessing finished.", flush=True)
     return temp_dir
 
@@ -423,7 +393,6 @@ def main(input_path: str, output_path: str, device=None):
 
     hat_output_dir = _run_hat_preprocess(input_path, device=device)
     stage2_config_path: Path | None = None
-    stage2_config_path: Path | None = None
 
     try:
         try:
@@ -438,14 +407,6 @@ def main(input_path: str, output_path: str, device=None):
             pass
 
         runtime = _resolve_runtime(output_path)
-        input_dir = hat_output_dir
-        sample_count = len(
-            [
-                path
-                for path in input_dir.iterdir()
-                if path.is_file() and path.suffix.lower() == ".png"
-            ]
-        )
         input_dir = hat_output_dir
         sample_count = len(
             [
@@ -480,8 +441,6 @@ def main(input_path: str, output_path: str, device=None):
         print(f"[team01_CIPLAB] Stage2 config: {stage2_config_path}", flush=True)
         step2_inference.main([str(stage2_config_path)])
     finally:
-        if stage2_config_path is not None:
-            stage2_config_path.unlink(missing_ok=True)
         if stage2_config_path is not None:
             stage2_config_path.unlink(missing_ok=True)
         keep_hat_output = os.environ.get("CIPLAB_KEEP_HAT_OUTPUT", "").strip().lower() in {"1", "true", "yes", "on"}
