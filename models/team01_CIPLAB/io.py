@@ -87,35 +87,6 @@ def _resolve_repo_path(path_value: str | Path) -> Path:
     return path.resolve()
 
 
-def _normalize_device_arg(device) -> str | None:
-    if device is None:
-        return None
-    if hasattr(device, "type"):
-        device_type = getattr(device, "type", None)
-        device_index = getattr(device, "index", None)
-        if device_type is None:
-            return str(device)
-        if device_index is None:
-            return str(device_type)
-        return f"{device_type}:{device_index}"
-    device_text = str(device).strip()
-    return device_text or None
-
-
-def _conda_env_prefix(wrapper_name: str, env_name: str) -> list[str]:
-    wrapper_path = shutil.which(wrapper_name)
-    if wrapper_path:
-        return [wrapper_path]
-
-    conda_path = shutil.which("conda")
-    if conda_path:
-        return [conda_path, "run", "-n", env_name, "--no-capture-output"]
-
-    raise FileNotFoundError(
-        f"Could not find `{wrapper_name}` or `conda` in PATH. "
-        "If you are using the provided Dockerfile, make sure the wrapper scripts were installed."
-    )
-
 def _resolve_override_path(raw_path: str, label: str) -> Path:
     resolved = _resolve_repo_path(raw_path)
     if resolved.exists():
@@ -206,6 +177,8 @@ def _stage_candidates_from_root(root: Path, stage_spec: dict) -> list[Path]:
     for alias in stage_spec["aliases"]:
         candidates.extend(
             (
+                root / "step2" / alias,
+                root / "step2_weight" / alias,
                 root / alias,
                 root / "train" / alias,
                 root / "loras" / alias,
@@ -354,6 +327,30 @@ def _load_prompt_text(prompt_name: str) -> str:
     raise KeyError(f"Prompt `{prompt_name}` not found in {prompts_path}")
 
 
+def _load_prompt_text(prompt_name: str) -> str:
+    prompts_path = (INFERENCE_DIR / "prompts.json").resolve()
+    if not prompts_path.is_file():
+        raise FileNotFoundError(f"Missing prompts.json: {prompts_path}")
+
+    with prompts_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if not isinstance(data, list):
+        raise ValueError(f"prompts.json must be a list: {prompts_path}")
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") != prompt_name:
+            continue
+        prompt = entry.get("prompt")
+        if prompt is None or not str(prompt).strip():
+            raise ValueError(f"Prompt `{prompt_name}` has an empty `prompt` field in {prompts_path}")
+        return str(prompt).strip()
+
+    raise KeyError(f"Prompt `{prompt_name}` not found in {prompts_path}")
+
+
 def _resolve_runtime(output_path: str) -> dict:
     output_dir = _resolve_repo_path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +363,7 @@ def _resolve_runtime(output_path: str) -> dict:
         "run_root": run_root,
         "base_model_path": base_model_path,
         "stage_paths": stage_paths,
+    }
     }
 
 def _print_launch_summary(input_dir: Path, sample_count: int, runtime: dict) -> None:
@@ -418,11 +416,36 @@ def main(input_path: str, output_path: str, device=None):
     if input_path is None or output_path is None:
         raise ValueError("`input_path` and `output_path` are required.")
 
+    try:
+        from .step2 import inference as step2_inference
+    except ImportError:
+        from step2 import inference as step2_inference
+
     hat_output_dir = _run_hat_preprocess(input_path, device=device)
+    stage2_config_path: Path | None = None
     stage2_config_path: Path | None = None
 
     try:
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         runtime = _resolve_runtime(output_path)
+        input_dir = hat_output_dir
+        sample_count = len(
+            [
+                path
+                for path in input_dir.iterdir()
+                if path.is_file() and path.suffix.lower() == ".png"
+            ]
+        )
         input_dir = hat_output_dir
         sample_count = len(
             [
@@ -455,14 +478,10 @@ def main(input_path: str, output_path: str, device=None):
             encoding="utf-8",
         )
         print(f"[team01_CIPLAB] Stage2 config: {stage2_config_path}", flush=True)
-        cmd = _conda_env_prefix("flux2", "flux2") + [
-            "python",
-            "-m",
-            "models.team01_CIPLAB.step2.inference",
-            str(stage2_config_path),
-        ]
-        subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+        step2_inference.main([str(stage2_config_path)])
     finally:
+        if stage2_config_path is not None:
+            stage2_config_path.unlink(missing_ok=True)
         if stage2_config_path is not None:
             stage2_config_path.unlink(missing_ok=True)
         keep_hat_output = os.environ.get("CIPLAB_KEEP_HAT_OUTPUT", "").strip().lower() in {"1", "true", "yes", "on"}
