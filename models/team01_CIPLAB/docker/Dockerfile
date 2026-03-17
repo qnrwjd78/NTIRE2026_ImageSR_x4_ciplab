@@ -45,7 +45,7 @@ RUN conda run -n sr_env pip install \
     tensorboard \
     Jinja2 \
     bitsandbytes \
-    prodigyopt \1
+    prodigyopt \
     huggingface-hub \
     wandb \
     safetensors
