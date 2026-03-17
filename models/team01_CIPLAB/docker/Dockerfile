@@ -1,36 +1,68 @@
-FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV CONDA_DIR=/opt/conda
-ENV PATH=/opt/conda/envs/sr_env/bin:/opt/conda/bin:$PATH
 WORKDIR /workspace
 
-SHELL ["/bin/bash", "-lc"]
-
+# OS deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
     git curl wget ca-certificates tmux \
-    bzip2 \
     build-essential ninja-build pkg-config \
     libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
-    && rm -rf /var/lib/apt/lists/* \
-    && wget -qO /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-py310_24.11.1-0-Linux-x86_64.sh \
-    && bash /tmp/miniconda.sh -b -p "$CONDA_DIR" \
-    && rm -f /tmp/miniconda.sh \
-    && conda config --system --set auto_update_conda false \
-    && conda config --system --set channel_priority strict
+    && rm -rf /var/lib/apt/lists/*
 
-RUN conda create -y -n sr_env python=3.10 pip
+# Miniconda
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
+ && bash /tmp/miniconda.sh -b -p /opt/conda \
+ && rm /tmp/miniconda.sh
 
-RUN conda run -n sr_env python -m pip install -U \
+ENV PATH=/opt/conda/bin:$PATH
+SHELL ["/bin/bash", "-lc"]
+
+# Use conda-forge only.
+RUN mkdir -p /etc/conda && \
+    printf "channels:\n  - conda-forge\nchannel_priority: strict\ndefault_channels: []\n" > /etc/conda/.condarc
+
+# =========================
+# Env: hat_env 
+# =========================
+RUN conda create -n hat_env -y --override-channels -c conda-forge python=3.10
+
+RUN conda run -n hat_env python -m pip install -U \
     "pip<25" \
     "setuptools<82" \
     wheel
 
-RUN conda run -n sr_env pip install --index-url https://download.pytorch.org/whl/cu117 \
+RUN conda run -n hat_env pip install --index-url https://download.pytorch.org/whl/cu117 \
     torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2
 
-RUN conda run -n sr_env pip install \
+RUN conda run -n hat_env pip install \
+    "numpy==1.26.4" \
+    opencv-python scikit-image scipy \
+    pyyaml tqdm requests einops lmdb h5py addict future yapf packaging
+
+RUN conda run -n hat_env pip install \
+    timm==0.9.16 transformers==4.38.1 huggingface-hub tensorboard
+
+RUN conda run -n hat_env pip install --no-build-isolation \
+    mamba-ssm==1.0.1 causal-conv1d==1.0.0
+
+RUN conda run -n hat_env pip install --no-build-isolation \
+    basicsr==1.3.4.9
+    
+# =========================
+# Env: flux2
+# =========================
+RUN conda create -n flux2 -y --override-channels -c conda-forge python=3.10
+
+RUN conda run -n flux2 python -m pip install -U \
+    "pip<25" \
+    "setuptools<82" \
+    wheel
+
+RUN conda run -n flux2 pip install --index-url https://download.pytorch.org/whl/cu117 \
+    torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2
+
+RUN conda run -n flux2 pip install \
     "numpy<2" \
     scipy \
     timm==0.9.16 \
@@ -50,49 +82,24 @@ RUN conda run -n sr_env pip install \
     wandb \
     safetensors
 
-RUN conda run -n sr_env pip install \
-    opencv-python scikit-image \
-    lmdb h5py addict future yapf
-
-RUN conda run -n sr_env pip install --no-build-isolation \
-    basicsr==1.3.4.9
-
-RUN conda run -n sr_env pip install \
+RUN conda run -n flux2 pip install \
     "diffusers @ git+https://github.com/huggingface/diffusers.git"
 
+# =========================
+# Convenience wrappers
+# =========================
+RUN printf '%s\n' \
+'#!/usr/bin/env bash' \
+'set -e' \
+'source /opt/conda/etc/profile.d/conda.sh' \
+'conda run -n hat_env --no-capture-output "$@"' \
+> /usr/local/bin/hat_env && chmod +x /usr/local/bin/hat_env
 
-FROM nvidia/cuda:11.7.1-cudnn8-runtime-ubuntu22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV CONDA_DIR=/opt/conda
-ENV PATH=/opt/conda/envs/sr_env/bin:/opt/conda/bin:$PATH
-WORKDIR /workspace
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    git curl wget ca-certificates tmux \
-    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /opt/conda /opt/conda
-
-RUN mkdir -p /opt/conda/envs/sr_env/etc/conda/activate.d \
-    /opt/conda/envs/sr_env/etc/conda/deactivate.d \
-    && printf '%s\n' \
-    '#!/bin/sh' \
-    'export _CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED="${TORCH_CUDNN_V8_API_DISABLED-__UNSET__}"' \
-    'export TORCH_CUDNN_V8_API_DISABLED=1' \
-    > /opt/conda/envs/sr_env/etc/conda/activate.d/torch_cudnn_v8_api_disabled.sh \
-    && printf '%s\n' \
-    '#!/bin/sh' \
-    'if [ "${_CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED}" = "__UNSET__" ]; then' \
-    '    unset TORCH_CUDNN_V8_API_DISABLED' \
-    'else' \
-    '    export TORCH_CUDNN_V8_API_DISABLED="${_CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED}"' \
-    'fi' \
-    'unset _CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED' \
-    > /opt/conda/envs/sr_env/etc/conda/deactivate.d/torch_cudnn_v8_api_disabled.sh
-
-RUN echo ". /opt/conda/etc/profile.d/conda.sh && conda activate sr_env" >> /root/.bashrc
+RUN printf '%s\n' \
+'#!/usr/bin/env bash' \
+'set -e' \
+'source /opt/conda/etc/profile.d/conda.sh' \
+'conda run -n flux2 --no-capture-output "$@"' \
+> /usr/local/bin/flux2 && chmod +x /usr/local/bin/flux2
 
 CMD ["bash"]

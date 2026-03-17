@@ -4,13 +4,9 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
-
-try:
-    from .step1 import hat_backend
-except ImportError:
-    from step1 import hat_backend
 
 
 TEAM_DIR = Path(__file__).resolve().parent
@@ -90,6 +86,35 @@ def _resolve_repo_path(path_value: str | Path) -> Path:
         path = REPO_ROOT / path
     return path.resolve()
 
+
+def _normalize_device_arg(device) -> str | None:
+    if device is None:
+        return None
+    if hasattr(device, "type"):
+        device_type = getattr(device, "type", None)
+        device_index = getattr(device, "index", None)
+        if device_type is None:
+            return str(device)
+        if device_index is None:
+            return str(device_type)
+        return f"{device_type}:{device_index}"
+    device_text = str(device).strip()
+    return device_text or None
+
+
+def _conda_env_prefix(wrapper_name: str, env_name: str) -> list[str]:
+    wrapper_path = shutil.which(wrapper_name)
+    if wrapper_path:
+        return [wrapper_path]
+
+    conda_path = shutil.which("conda")
+    if conda_path:
+        return [conda_path, "run", "-n", env_name, "--no-capture-output"]
+
+    raise FileNotFoundError(
+        f"Could not find `{wrapper_name}` or `conda` in PATH. "
+        "If you are using the provided Dockerfile, make sure the wrapper scripts were installed."
+    )
 
 def _resolve_override_path(raw_path: str, label: str) -> Path:
     resolved = _resolve_repo_path(raw_path)
@@ -375,7 +400,16 @@ def _run_hat_preprocess(input_path: str, device=None) -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix="ciplab_hat_pre_", dir=str(TMP_ROOT))).resolve()
     print("[team01_CIPLAB] Starting HAT preprocessing stage...", flush=True)
     print(f"  hat_output_dir       : {temp_dir}", flush=True)
-    hat_backend.run_from_input_dir(input_path, str(temp_dir), device=device)
+    device_text = _normalize_device_arg(device)
+    cmd = _conda_env_prefix("hat_env", "hat_env") + [
+        "python",
+        "-m",
+        "models.team01_CIPLAB.step1.run",
+    ]
+    if device_text:
+        cmd.extend(["--device", device_text])
+    cmd.extend([str(input_path), str(temp_dir)])
+    subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
     print("[team01_CIPLAB] HAT preprocessing finished.", flush=True)
     return temp_dir
 
@@ -384,26 +418,10 @@ def main(input_path: str, output_path: str, device=None):
     if input_path is None or output_path is None:
         raise ValueError("`input_path` and `output_path` are required.")
 
-    try:
-        from .step2 import inference as step2_inference
-    except ImportError:
-        from step2 import inference as step2_inference
-
     hat_output_dir = _run_hat_preprocess(input_path, device=device)
     stage2_config_path: Path | None = None
 
     try:
-        try:
-            import gc
-
-            import torch
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
         runtime = _resolve_runtime(output_path)
         input_dir = hat_output_dir
         sample_count = len(
@@ -437,7 +455,13 @@ def main(input_path: str, output_path: str, device=None):
             encoding="utf-8",
         )
         print(f"[team01_CIPLAB] Stage2 config: {stage2_config_path}", flush=True)
-        step2_inference.main([str(stage2_config_path)])
+        cmd = _conda_env_prefix("flux2", "flux2") + [
+            "python",
+            "-m",
+            "models.team01_CIPLAB.step2.inference",
+            str(stage2_config_path),
+        ]
+        subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
     finally:
         if stage2_config_path is not None:
             stage2_config_path.unlink(missing_ok=True)
