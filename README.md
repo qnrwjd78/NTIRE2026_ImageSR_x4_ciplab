@@ -1,14 +1,14 @@
-## team01_CIPLAB
+# team01_CIPLAB
 
 
-## Stert
+## 1. Start
 
 ```bash
 git clone https://github.com/qnrwjd78/NTIRE2026_ImageSR_x4_ciplab.git
 cd NTIRE2026_ImageSR_x4_ciplab
 ```
 
-## Environment
+## 2. Environment
 
 Build from the repository root:
 
@@ -26,6 +26,20 @@ docker run --gpus all -it --rm \
 
 The container uses the `sr_env` conda environment by default.
 
+## ３. Weight Download
+
+```bash
+hf download Jasonlee1995/ntire2026 --local-dir ./model_zoo/team01_CIPLAB/
+```
+https://huggingface.co/Jasonlee1995/ntire2026/tree/main
+The URLs are listed in team01_CIPLAB.txt
+
+Sources:
+
+- FLUX.2:
+  [black-forest-labs/FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)
+- HAT-L_SRx4_ImageNet-pretrain.pth:
+  [jaideepsingh/upscale_models HAT mirror](https://huggingface.co/jaideepsingh/upscale_models/resolve/main/HAT/HAT-L_SRx4_ImageNet-pretrain.pth)
 ## Weight Folder Structure
 
 Expected layout under `model_zoo`:
@@ -53,18 +67,7 @@ Notes:
 - `flux2-klein-base-9b/` is the Step 2 base diffusers checkpoint.
 - `step2_weight/stage1`, `step2_weight/stage2`, and optional `step2_weight/stage3` should contain LoRA checkpoints such as `pytorch_lora_weights.safetensors` and `adapter_config.json`.
 
-## Weight Download
 
-The URLs are listed in [team01_CIPLAB.txt](NTIRE2026_ImageSR_x4_ciplab/model_zoo/team01_CIPLAB/team01_CIPLAB.txt).
-Download the first line as the FLUX.2 base model
-Download the second line as the HAT weight
-
-Sources:
-
-- FLUX.2:
-  [black-forest-labs/FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)
-- HAT-L_SRx4_ImageNet-pretrain.pth:
-  [jaideepsingh/upscale_models HAT mirror](https://huggingface.co/jaideepsingh/upscale_models/resolve/main/HAT/HAT-L_SRx4_ImageNet-pretrain.pth)
 
 ## test.py
 
