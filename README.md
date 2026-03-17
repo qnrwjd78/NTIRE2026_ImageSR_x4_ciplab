@@ -1,11 +1,19 @@
 ## team01_CIPLAB
 
+
+## Stert
+
+```bash
+git clone https://github.com/qnrwjd78/NTIRE2026_ImageSR_x4_ciplab.git
+cd NTIRE2026_ImageSR_x4_ciplab
+```
+
 ## Environment
 
 Build from the repository root:
 
 ```bash
-docker build -t team01_ciplab -f models/team01_CIPLAB/Dockerfile .
+docker build -t team01_ciplab -f models/team01_CIPLAB/docker/Dockerfile .
 ```
 
 Run an interactive container:

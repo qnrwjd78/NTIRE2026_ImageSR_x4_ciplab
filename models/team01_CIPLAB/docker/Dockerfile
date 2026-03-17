@@ -76,7 +76,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/conda /opt/conda
 
-ENV TORCH_CUDNN_V8_API_DISABLED=1
+RUN mkdir -p /opt/conda/envs/sr_env/etc/conda/activate.d \
+    /opt/conda/envs/sr_env/etc/conda/deactivate.d \
+    && printf '%s\n' \
+    '#!/bin/sh' \
+    'export _CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED="${TORCH_CUDNN_V8_API_DISABLED-__UNSET__}"' \
+    'export TORCH_CUDNN_V8_API_DISABLED=1' \
+    > /opt/conda/envs/sr_env/etc/conda/activate.d/torch_cudnn_v8_api_disabled.sh \
+    && printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "${_CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED}" = "__UNSET__" ]; then' \
+    '    unset TORCH_CUDNN_V8_API_DISABLED' \
+    'else' \
+    '    export TORCH_CUDNN_V8_API_DISABLED="${_CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED}"' \
+    'fi' \
+    'unset _CONDA_OLD_TORCH_CUDNN_V8_API_DISABLED' \
+    > /opt/conda/envs/sr_env/etc/conda/deactivate.d/torch_cudnn_v8_api_disabled.sh
 
 RUN echo ". /opt/conda/etc/profile.d/conda.sh && conda activate sr_env" >> /root/.bashrc
 
