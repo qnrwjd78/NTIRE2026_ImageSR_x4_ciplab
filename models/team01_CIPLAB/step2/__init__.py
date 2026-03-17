@@ -1,1 +1,1 @@
-from .lora_inference import main
+from .inference import main

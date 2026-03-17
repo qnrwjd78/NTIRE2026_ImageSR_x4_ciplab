@@ -30,15 +30,9 @@ LORA_ARTIFACT_NAMES = (
 
 BASE_MODEL_DIRNAME = "flux2-klein-base-9b"
 DEFAULT_PROMPT_NAME = "test_3"
-DEFAULT_MODE = "canvas_tile"
-DEFAULT_CROP_MODE = "full"
 DEFAULT_TILE_SIZE_PX = 1024
 DEFAULT_TILE_OVERLAP_PX = 512
 DEFAULT_TILE_BATCH_SIZE = 6
-DEFAULT_TILE_SIGMA_RATIO = 0.15
-DEFAULT_CANVAS_PADDING_MODE = "reflect"
-DEFAULT_CANVAS_PADDING_POSITION = "center"
-DEFAULT_CANVAS_PADDING_VALUE = 0.0
 DEFAULT_GUIDANCE_SCALE = 4.0
 DEFAULT_NUM_INFERENCE_STEPS = 50
 DEFAULT_DTYPE = "bf16"
@@ -95,59 +89,6 @@ def _resolve_repo_path(path_value: str | Path) -> Path:
     if not path.is_absolute():
         path = REPO_ROOT / path
     return path.resolve()
-
-
-def _normalize_device_arg(device) -> str | None:
-    if device is None:
-        return None
-    if hasattr(device, "type"):
-        device_type = getattr(device, "type", None)
-        device_index = getattr(device, "index", None)
-        if device_type is None:
-            return str(device)
-        if device_index is None:
-            return str(device_type)
-        return f"{device_type}:{device_index}"
-    device_text = str(device).strip()
-    return device_text or None
-
-
-def _resolve_input_dir(input_path: str) -> Path:
-    input_dir = _resolve_repo_path(input_path)
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"Input path must be a directory of images: {input_dir}")
-
-    if _has_image_files(input_dir):
-        return input_dir
-
-    for child_name in ("LQ", "lq", "LR", "lr", "input", "inputs"):
-        child_dir = input_dir / child_name
-        if child_dir.is_dir() and _has_image_files(child_dir):
-            return child_dir.resolve()
-
-    raise ValueError(
-        f"No input images found under: {input_dir}. "
-        "Expected images directly in the folder or under an `LQ` subdirectory."
-    )
-
-
-def _build_manifest(input_path: str) -> Path:
-    input_dir = _resolve_input_dir(input_path)
-    TMP_ROOT.mkdir(parents=True, exist_ok=True)
-
-    items = []
-    for image_path in sorted(input_dir.iterdir()):
-        if image_path.suffix.lower() not in IMAGE_EXTENSIONS or not image_path.is_file():
-            continue
-        items.append({"hr": str(image_path), "res": str(image_path)})
-
-    if not items:
-        raise ValueError(f"No input images found under: {input_dir}")
-
-    fd, temp_path = tempfile.mkstemp(prefix="ciplab_infer_", suffix=".json", dir=str(TMP_ROOT))
-    os.close(fd)
-    Path(temp_path).write_text(json.dumps(items, indent=2), encoding="utf-8")
-    return Path(temp_path)
 
 
 def _resolve_override_path(raw_path: str, label: str) -> Path:
@@ -364,114 +305,43 @@ def _make_temp_json_path(prefix: str) -> Path:
     return Path(temp_path)
 
 
+def _load_prompt_text(prompt_name: str) -> str:
+    prompts_path = (INFERENCE_DIR / "prompts.json").resolve()
+    if not prompts_path.is_file():
+        raise FileNotFoundError(f"Missing prompts.json: {prompts_path}")
+
+    with prompts_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if not isinstance(data, list):
+        raise ValueError(f"prompts.json must be a list: {prompts_path}")
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") != prompt_name:
+            continue
+        prompt = entry.get("prompt")
+        if prompt is None or not str(prompt).strip():
+            raise ValueError(f"Prompt `{prompt_name}` has an empty `prompt` field in {prompts_path}")
+        return str(prompt).strip()
+
+    raise KeyError(f"Prompt `{prompt_name}` not found in {prompts_path}")
+
+
 def _resolve_runtime(output_path: str) -> dict:
     output_dir = _resolve_repo_path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_root = _discover_run_root()
     stage_paths = _discover_stage_paths(run_root)
     base_model_path = _discover_base_model_path()
-    sem_adapter_names = ["sem"]
-    sem_lora_paths = [str(stage_paths["sem"])]
-    sem_adapter_scales = ["1.0"]
-    if "sem2" in stage_paths:
-        sem_adapter_names.append("sem2")
-        sem_lora_paths.append(str(stage_paths["sem2"]))
-        sem_adapter_scales.append("1.0")
 
     return {
         "output_dir": output_dir,
         "run_root": run_root,
         "base_model_path": base_model_path,
         "stage_paths": stage_paths,
-        "sem_adapter_names": sem_adapter_names,
-        "sem_lora_paths": sem_lora_paths,
-        "sem_adapter_scales": sem_adapter_scales,
     }
-
-
-def _build_cli_args(input_json: Path, output_json: Path, runtime: dict, device=None) -> list[str]:
-    output_dir = runtime["output_dir"]
-    stage_paths = runtime["stage_paths"]
-
-    args = [
-        "--pretrained_model_name_or_path",
-        str(runtime["base_model_path"]),
-        "--input_json",
-        str(input_json),
-        "--output_dir",
-        str(output_dir),
-        "--output_json",
-        str(output_json),
-        "--prompts_json",
-        str((INFERENCE_DIR / "prompts.json").resolve()),
-        "--prompt_name",
-        DEFAULT_PROMPT_NAME,
-        "--mode",
-        DEFAULT_MODE,
-        "--crop_mode",
-        DEFAULT_CROP_MODE,
-        "--tile_size_px",
-        str(DEFAULT_TILE_SIZE_PX),
-        "--tile_overlap_px",
-        str(DEFAULT_TILE_OVERLAP_PX),
-        "--tile_batch_size",
-        str(DEFAULT_TILE_BATCH_SIZE),
-        "--sample_batch_size",
-        "1",
-        "--tile_sigma_ratio",
-        str(DEFAULT_TILE_SIGMA_RATIO),
-        "--canvas_padding_mode",
-        DEFAULT_CANVAS_PADDING_MODE,
-        "--canvas_padding_position",
-        DEFAULT_CANVAS_PADDING_POSITION,
-        "--canvas_padding_value",
-        str(DEFAULT_CANVAS_PADDING_VALUE),
-        "--guidance_scale",
-        str(DEFAULT_GUIDANCE_SCALE),
-        "--num_inference_steps",
-        str(DEFAULT_NUM_INFERENCE_STEPS),
-        "--dtype",
-        DEFAULT_DTYPE,
-        "--seed",
-        str(DEFAULT_SEED),
-        "--pix_lora_weights_path",
-        str(stage_paths["pix"]),
-        "--pix_adapter_name",
-        "pix",
-        "--pix_adapter_scale",
-        "1.0",
-    ]
-
-    if DEFAULT_CPU_OFFLOAD:
-        args.append("--cpu_offload")
-
-    normalized_device = _normalize_device_arg(device)
-    if normalized_device:
-        args.extend(["--device", normalized_device])
-
-    args.extend(
-        [
-            "--sem_adapter_names",
-            ",".join(runtime["sem_adapter_names"]),
-            "--sem_lora_weights_paths",
-            ",".join(runtime["sem_lora_paths"]),
-            "--sem_adapter_scales",
-            ",".join(runtime["sem_adapter_scales"]),
-        ]
-    )
-
-    return args
-
-
-def _read_manifest_info(manifest_path: Path):
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        items = json.load(handle)
-    if not isinstance(items, list) or not items:
-        raise ValueError(f"Manifest must contain at least one sample: {manifest_path}")
-
-    first_res_path = Path(items[0]["res"]).expanduser().resolve()
-    return first_res_path.parent, len(items)
-
 
 def _print_launch_summary(input_dir: Path, sample_count: int, runtime: dict) -> None:
     stage_paths = runtime["stage_paths"]
@@ -486,8 +356,6 @@ def _print_launch_summary(input_dir: Path, sample_count: int, runtime: dict) -> 
     print(f"  stage2_sem           : {stage_paths['sem']}", flush=True)
     print(f"  stage3_sem2          : {sem2_path if sem2_path else '<disabled>'}", flush=True)
     print(f"  prompt_name          : {DEFAULT_PROMPT_NAME}", flush=True)
-    print(f"  mode                 : {DEFAULT_MODE}", flush=True)
-    print(f"  crop_mode            : {DEFAULT_CROP_MODE}", flush=True)
     print(
         f"  tile                 : size={DEFAULT_TILE_SIZE_PX}, overlap={DEFAULT_TILE_OVERLAP_PX}, batch={DEFAULT_TILE_BATCH_SIZE}",
         flush=True,
@@ -517,23 +385,62 @@ def main(input_path: str, output_path: str, device=None):
         raise ValueError("`input_path` and `output_path` are required.")
 
     try:
-        from .step2 import lora_inference
+        from .step2 import inference as step2_inference
     except ImportError:
-        from step2 import lora_inference
+        from step2 import inference as step2_inference
 
     hat_output_dir = _run_hat_preprocess(input_path, device=device)
-    manifest_path = _build_manifest(str(hat_output_dir))
-    output_json_path = _make_temp_json_path("ciplab_results_")
+    stage2_config_path: Path | None = None
 
     try:
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         runtime = _resolve_runtime(output_path)
-        input_dir, sample_count = _read_manifest_info(manifest_path)
+        input_dir = hat_output_dir
+        sample_count = len(
+            [
+                path
+                for path in input_dir.iterdir()
+                if path.is_file() and path.suffix.lower() == ".png"
+            ]
+        )
         _print_launch_summary(input_dir, sample_count, runtime)
-        cli_args = _build_cli_args(manifest_path, output_json_path, runtime, device=device)
-        lora_inference.main(cli_args)
+        stage2_config = {
+            "instance_prompt": _load_prompt_text(DEFAULT_PROMPT_NAME),
+            "pretrained_model_name_or_path": str(runtime["base_model_path"]),
+            "resolution": DEFAULT_TILE_SIZE_PX,
+            "tile_overlap_px": DEFAULT_TILE_OVERLAP_PX,
+            "tile_batch_size": DEFAULT_TILE_BATCH_SIZE,
+            "num_inference_steps": DEFAULT_NUM_INFERENCE_STEPS,
+            "guidance_scale": DEFAULT_GUIDANCE_SCALE,
+            "max_sequence_length": 512,
+            "seed": DEFAULT_SEED,
+            "adapter_scale": 1.0,
+            "cpu_offload": DEFAULT_CPU_OFFLOAD,
+            "input_dir": str(input_dir),
+            "pix_lora_weights_path": str(runtime["stage_paths"]["pix"]),
+            "sem_lora_weights_path": str(runtime["stage_paths"]["sem"]),
+            "output_dir": str(runtime["output_dir"]),
+        }
+        stage2_config_path = _make_temp_json_path("ciplab_stage2_")
+        stage2_config_path.write_text(
+            json.dumps(stage2_config, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[team01_CIPLAB] Stage2 config: {stage2_config_path}", flush=True)
+        step2_inference.main([str(stage2_config_path)])
     finally:
-        manifest_path.unlink(missing_ok=True)
-        output_json_path.unlink(missing_ok=True)
+        if stage2_config_path is not None:
+            stage2_config_path.unlink(missing_ok=True)
         keep_hat_output = os.environ.get("CIPLAB_KEEP_HAT_OUTPUT", "").strip().lower() in {"1", "true", "yes", "on"}
         if keep_hat_output:
             print(f"[team01_CIPLAB] Keeping intermediate HAT output: {hat_output_dir}", flush=True)
